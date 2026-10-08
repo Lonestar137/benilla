@@ -174,6 +174,11 @@ pub(super) fn feed_action_state(
             ACTION_KIND_SPELL => {
                 let d = spells.as_ref().and_then(|s| s.catalog.get(button.action));
                 let Some(d) = d else {
+                    if id == super::SPELL_ATTACK || id == 133 {
+                        st.usable = true;
+                        st.is_attack = id == super::SPELL_ATTACK;
+                        st.current = st.is_attack && engaged;
+                    }
                     fresh.insert(action, st);
                     continue;
                 };

@@ -167,6 +167,13 @@ fn feed_spellbook(
     // Drained before a later return can strand it; an unresolved id fires nothing, as in 1.12.
     let learned = std::mem::take(&mut learned.0);
     let Some(spells) = spells.as_deref() else {
+        let fresh = starter_book(&actions.spells);
+        if fresh != memory.pushed {
+            gate.audit("feed_spellbook", "the offline starter spellbook fallback");
+            script.set_spellbook(fresh.clone());
+            memory.pushed = fresh;
+            script.fire_event("SPELLS_CHANGED", vec![]);
+        }
         return;
     };
     // Race and class drive the General collapse; 0/0 before the descriptor skips it.
@@ -390,6 +397,43 @@ fn build_book(
         });
     }
     (SpellBookState { tabs, slots }, tab_lines)
+}
+
+/// The offline slice's two project-owned starter abilities remain visible if their client catalog
+/// rows fail to load; the game-core still validates and resolves their casts.
+fn starter_book(known: &BTreeSet<u32>) -> SpellBookState {
+    let mut tabs = Vec::new();
+    let mut slots = Vec::new();
+    if known.contains(&crate::ui_action::SPELL_ATTACK) {
+        tabs.push(SpellTabView {
+            name: "General".into(),
+            texture: Some(GENERAL_TAB_ICON.into()),
+            offset: slots.len() as u32,
+            num_spells: 1,
+        });
+        slots.push(SpellSlotView {
+            spell_id: crate::ui_action::SPELL_ATTACK,
+            name: "Attack".into(),
+            texture: Some("Interface\\Icons\\Ability_MeleeDamage".into()),
+            ..Default::default()
+        });
+    }
+    if known.contains(&133) {
+        tabs.push(SpellTabView {
+            name: "Fire".into(),
+            texture: Some("Interface\\Icons\\Spell_Fire_FlameBolt".into()),
+            offset: slots.len() as u32,
+            num_spells: 1,
+        });
+        slots.push(SpellSlotView {
+            spell_id: 133,
+            name: "Fireball".into(),
+            rank: Some("Rank 1".into()),
+            texture: Some("Interface\\Icons\\Spell_Fire_FlameBolt".into()),
+            ..Default::default()
+        });
+    }
+    SpellBookState { tabs, slots }
 }
 
 /// `0x4b30c0`'s tail: name, then the parsed rank number, then the rank string. The rank is the
@@ -642,5 +686,21 @@ mod tests {
             icon_of(&bare, AUTO_SHOT).as_deref(),
             Some("Interface\\Icons\\Ability_AutoShot")
         );
+    }
+
+    #[test]
+    fn starter_book_fallback_keeps_offline_attack_and_fireball_visible_without_spell_dbc() {
+        let known: BTreeSet<u32> = [crate::ui_action::SPELL_ATTACK, 133].into_iter().collect();
+        let book = starter_book(&known);
+        assert_eq!(
+            book.tabs.iter().map(|tab| tab.name.as_str()).collect::<Vec<_>>(),
+            ["General", "Fire"]
+        );
+        assert_eq!(
+            book.slots.iter().map(|slot| slot.spell_id).collect::<Vec<_>>(),
+            [crate::ui_action::SPELL_ATTACK, 133]
+        );
+        assert_eq!(book.slots[1].name, "Fireball");
+        assert_eq!(book.slots[1].rank.as_deref(), Some("Rank 1"));
     }
 }

@@ -10,10 +10,15 @@ const PROFILE_VERSION: u32 = 1;
 const SNAPSHOT_VERSION: u32 = 1;
 pub const MAX_CHARACTERS: usize = 10;
 pub const INITIAL_GAME_TIME_MINUTES: u64 = 12 * 60;
+pub const ATTACK_SPELL_ID: u32 = 6603;
 pub const FIREBALL_SPELL_ID: u32 = 133;
 pub const HOSTILE_SPAWN_ID: u32 = 1;
 pub const FIREBALL_CAST_MS: u32 = 1_500;
 pub const FIREBALL_RANGE_YARDS: f32 = 35.0;
+pub const FIREBALL_MANA_COST: u32 = 30;
+pub const MELEE_RANGE_YARDS: f32 = 5.0;
+pub const MELEE_SWING_MS: u32 = 2_000;
+pub const MELEE_DAMAGE: u32 = 5;
 pub const STARTER_MANA: u32 = 100;
 pub const HOSTILE_MAX_HEALTH: u32 = 60;
 pub const HOSTILE_RESPAWN_MS: u32 = 30_000;
@@ -105,6 +110,7 @@ pub struct CastImpact {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CombatUpdate {
     Impact(CastImpact),
+    MeleeImpact(CastImpact),
     Respawned { spawn_id: u32 },
 }
 
@@ -220,6 +226,8 @@ pub struct GameCore {
     cast_remaining_ms: u32,
     cooldown_remaining_ms: u32,
     cast_target_spawn_id: Option<u32>,
+    melee_target_spawn_id: Option<u32>,
+    melee_remaining_ms: u32,
     active_mana: u32,
 }
 
@@ -380,6 +388,8 @@ impl GameCore {
         self.cast_remaining_ms = 0;
         self.cooldown_remaining_ms = 0;
         self.cast_target_spawn_id = None;
+        self.melee_target_spawn_id = None;
+        self.melee_remaining_ms = 0;
         self.active_mana = if snapshot.appearance.class == 8 {
             STARTER_MANA
         } else {
@@ -401,6 +411,32 @@ impl GameCore {
 
     pub fn active_mana(&self) -> u32 {
         self.active_mana
+    }
+
+    /// Start the common auto-attack against a living hostile within melee range.
+    pub fn start_auto_attack(&mut self, spawn_id: u32) -> Result<(), CoreError> {
+        let id = self.active.as_ref().ok_or(CoreError::NoCharacterSelected)?;
+        let snapshot = self.snapshots.get(id).ok_or(CoreError::CharacterNotFound)?;
+        let hostile = self
+            .hostiles
+            .iter()
+            .find(|hostile| hostile.spawn_id == spawn_id && hostile.health > 0)
+            .ok_or(CoreError::InvalidTarget)?;
+        if snapshot.position.map_id != hostile.position.map_id
+            || distance_squared(snapshot.position, hostile.position)
+                > MELEE_RANGE_YARDS * MELEE_RANGE_YARDS
+        {
+            return Err(CoreError::OutOfRange);
+        }
+        self.melee_target_spawn_id = Some(spawn_id);
+        self.melee_remaining_ms = MELEE_SWING_MS;
+        Ok(())
+    }
+
+    /// Stop the active auto-attack and report its target so presentation can clear the combat edge.
+    pub fn stop_auto_attack(&mut self) -> Option<u32> {
+        self.melee_remaining_ms = 0;
+        self.melee_target_spawn_id.take()
     }
 
     /// Begin the starter Mage's Fireball against an authored hostile spawn.
@@ -499,6 +535,53 @@ impl GameCore {
                 self.cast_remaining_ms -= elapsed_ms;
             }
         }
+        let mut elapsed = elapsed_ms;
+        while let Some(spawn_id) = self.melee_target_spawn_id {
+            if elapsed < self.melee_remaining_ms {
+                self.melee_remaining_ms -= elapsed;
+                break;
+            }
+            elapsed -= self.melee_remaining_ms;
+            let Some(id) = self.active.as_ref() else {
+                self.stop_auto_attack();
+                break;
+            };
+            let Some(snapshot) = self.snapshots.get(id) else {
+                self.stop_auto_attack();
+                break;
+            };
+            let Some(hostile) = self
+                .hostiles
+                .iter_mut()
+                .find(|hostile| hostile.spawn_id == spawn_id && hostile.health > 0)
+            else {
+                self.stop_auto_attack();
+                break;
+            };
+            if snapshot.position.map_id != hostile.position.map_id
+                || distance_squared(snapshot.position, hostile.position)
+                    > MELEE_RANGE_YARDS * MELEE_RANGE_YARDS
+            {
+                self.stop_auto_attack();
+                break;
+            }
+            hostile.health = hostile.health.saturating_sub(MELEE_DAMAGE);
+            let killed = hostile.health == 0;
+            if killed {
+                hostile.respawn_remaining_ms = Some(HOSTILE_RESPAWN_MS);
+            }
+            updates.push(CombatUpdate::MeleeImpact(CastImpact {
+                spawn_id,
+                damage: MELEE_DAMAGE,
+                remaining_health: hostile.health,
+                killed,
+            }));
+            if killed {
+                self.stop_auto_attack();
+            } else {
+                self.melee_remaining_ms = MELEE_SWING_MS;
+            }
+        }
         updates
     }
 
@@ -530,6 +613,7 @@ impl GameCore {
         self.cast_remaining_ms = 0;
         self.cooldown_remaining_ms = 0;
         self.cast_target_spawn_id = None;
+        self.stop_auto_attack();
         self.active_mana = 0;
         self.snapshots
             .get(&id)
@@ -605,6 +689,8 @@ impl GameCore {
             cast_remaining_ms: 0,
             cooldown_remaining_ms: 0,
             cast_target_spawn_id: None,
+            melee_target_spawn_id: None,
+            melee_remaining_ms: 0,
             active_mana: 0,
         })
     }
@@ -927,6 +1013,47 @@ mod tests {
         assert_eq!(
             core.begin_fireball(FIREBALL_SPELL_ID, hostile.spawn_id, 30, FIREBALL_CAST_MS,),
             Err(CoreError::OutOfRange)
+        );
+    }
+
+    #[test]
+    fn auto_attack_swings_on_a_deterministic_timer_and_stops_cleanly() {
+        let (mut core, _, _) = core_with_two();
+        core.enter_world().unwrap();
+        core.update_active(
+            WorldPosition {
+                x: START.x + 8.0,
+                ..START
+            },
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(core.start_auto_attack(HOSTILE_SPAWN_ID), Ok(()));
+        assert_eq!(
+            core.advance_combat(MELEE_SWING_MS - 1),
+            Vec::<CombatUpdate>::new()
+        );
+        assert_eq!(
+            core.hostile(HOSTILE_SPAWN_ID).unwrap().health,
+            HOSTILE_MAX_HEALTH
+        );
+        assert_eq!(
+            core.advance_combat(1),
+            vec![CombatUpdate::MeleeImpact(CastImpact {
+                spawn_id: HOSTILE_SPAWN_ID,
+                damage: MELEE_DAMAGE,
+                remaining_health: HOSTILE_MAX_HEALTH - MELEE_DAMAGE,
+                killed: false,
+            })]
+        );
+
+        assert_eq!(core.stop_auto_attack(), Some(HOSTILE_SPAWN_ID));
+        assert_eq!(core.stop_auto_attack(), None);
+        assert!(core.advance_combat(MELEE_SWING_MS * 2).is_empty());
+        assert_eq!(
+            core.hostile(HOSTILE_SPAWN_ID).unwrap().health,
+            HOSTILE_MAX_HEALTH - MELEE_DAMAGE
         );
     }
 

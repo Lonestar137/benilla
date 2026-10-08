@@ -111,6 +111,7 @@ fn clicking_the_main_menu_micro_button_opens_and_closes_the_live_menu() {
     super::test_ui::load_ui(&s, "Interface\\FrameXML\\GlobalStrings.lua");
     let failures = super::load_default_ui(&s);
     assert!(failures.is_empty(), "manifest load errors: {failures:#?}");
+    s.fire_event("PLAYER_ENTERING_WORLD", vec![]);
     s.resolve();
 
     super::test_ui::click(&mut s, "MainMenuMicroButton", "LeftButton");
@@ -124,6 +125,102 @@ fn clicking_the_main_menu_micro_button_opens_and_closes_the_live_menu() {
         "the same button closes the menu"
     );
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
+#[test]
+fn clicking_character_spellbook_and_map_microbuttons_opens_their_panels() {
+    let _data = benilla_formats::wow_data_or_skip!();
+    let mut s = UiScript::new().unwrap();
+    s.set_screen_size(1024.0, 768.0);
+    s.set_unit(
+        "player",
+        Some(UnitState {
+            exists: true,
+            name: Some("Testelf".into()),
+            level: 1,
+            race: Some("Blood Elf".into()),
+            race_file: Some("BloodElf".into()),
+            class: Some("Mage".into()),
+            class_file: Some("MAGE".into()),
+            sex: 2,
+            is_player: true,
+            player_controlled: true,
+            ..Default::default()
+        }),
+    );
+    super::test_ui::load_ui(&s, "Interface\\FrameXML\\GlobalStrings.lua");
+    let failures = super::load_default_ui(&s);
+    assert!(failures.is_empty(), "manifest load errors: {failures:#?}");
+    s.run(
+        r#"for _, name in ipairs({ "CharacterMicroButton", "SpellbookMicroButton",
+            "TalentMicroButton", "QuestLogMicroButton", "SocialsMicroButton",
+            "WorldMapMicroButton", "MainMenuMicroButton", "HelpMicroButton" }) do
+            local button = getglobal(name)
+            if button then button:SetScript("OnClick", function() end) end
+        end"#,
+    )
+    .unwrap();
+    super::test_ui::load_ui(&s, "FrameXMLFixes.xml");
+    s.fire_event("PLAYER_ENTERING_WORLD", vec![]);
+    s.resolve();
+    for name in [
+        "CharacterMicroButton",
+        "SpellbookMicroButton",
+        "QuestLogMicroButton",
+        "SocialsMicroButton",
+        "WorldMapMicroButton",
+        "MainMenuMicroButton",
+    ] {
+        assert!(
+            s.eval::<bool>(&format!("return {name}:IsEnabled() ~= 0"))
+                .unwrap(),
+            "offline microbutton {name} stays enabled without a server login state"
+        );
+    }
+
+    super::test_ui::click(&mut s, "CharacterMicroButton", "LeftButton");
+    assert!(
+        s.eval::<bool>("return CharacterFrame:IsVisible()").unwrap(),
+        "the character microbutton opens the sheet"
+    );
+    super::test_ui::click(&mut s, "CharacterMicroButton", "LeftButton");
+    assert!(
+        !s.eval::<bool>("return CharacterFrame:IsVisible()").unwrap(),
+        "the character microbutton closes the sheet"
+    );
+
+    super::test_ui::click(&mut s, "SpellbookMicroButton", "LeftButton");
+    assert!(
+        s.eval::<bool>("return SpellBookFrame:IsVisible()").unwrap(),
+        "the spellbook microbutton opens the learned-spell panel"
+    );
+    super::test_ui::click(&mut s, "SpellbookMicroButton", "LeftButton");
+    assert!(
+        !s.eval::<bool>("return SpellBookFrame:IsVisible()").unwrap(),
+        "the spellbook microbutton closes the panel"
+    );
+
+    super::test_ui::click(&mut s, "QuestLogMicroButton", "LeftButton");
+    assert!(
+        s.eval::<bool>("return QuestLogFrame:IsVisible()").unwrap(),
+        "the quest-log microbutton opens its panel"
+    );
+    s.run("HideUIPanel(QuestLogFrame)").unwrap();
+
+    super::test_ui::click(&mut s, "SocialsMicroButton", "LeftButton");
+    assert!(
+        s.eval::<bool>("return FriendsFrame:IsVisible()").unwrap(),
+        "the social microbutton opens the friends panel"
+    );
+    s.run("HideUIPanel(FriendsFrame)").unwrap();
+
+    super::test_ui::click(&mut s, "WorldMapMicroButton", "LeftButton");
+    assert!(
+        s.eval::<bool>("return WorldMapFrame:IsVisible()").unwrap(),
+        "the map microbutton opens the map panel"
+    );
+    s.run("HideUIPanel(WorldMapFrame)").unwrap();
+    assert!(s.errors().is_empty(), "click errors: {:?}", s.errors());
 }
 
 /// `HitRectInsets top="18"` (`MainMenuBarMicroButtons.xml:8`): the art fills the lower 40 of 58.

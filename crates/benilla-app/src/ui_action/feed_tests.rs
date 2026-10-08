@@ -4,7 +4,9 @@
 use std::collections::HashMap;
 
 use benilla_formats::{ItemDisplay, ItemDisplayCatalog};
-use benilla_protocol::messages::{ActionButton, ItemSpellEntry, ACTION_KIND_ITEM};
+use benilla_protocol::messages::{
+    ActionButton, ItemSpellEntry, ACTION_KIND_ITEM, ACTION_KIND_SPELL,
+};
 use benilla_ui::script::UiScript;
 use bevy::prelude::*;
 
@@ -85,6 +87,35 @@ fn fed_consumable(app: &mut App) -> Option<i64> {
         .unwrap()
 }
 
+#[test]
+fn offline_starter_spells_keep_icons_when_a_catalog_entry_is_missing() {
+    let (mut app, _rx) = app_with_food_on_the_bar();
+    {
+        let mut actions = app.world_mut().resource_mut::<PlayerActions>();
+        actions.buttons.clear();
+        actions.buttons.insert(
+            0,
+            ActionButton {
+                slot: 0,
+                action: super::SPELL_ATTACK,
+                kind: ACTION_KIND_SPELL,
+            },
+        );
+        actions.dirty = true;
+    }
+
+    app.update();
+
+    assert_eq!(
+        app.world_mut()
+            .non_send_resource::<UiScript>()
+            .eval::<Option<String>>("return GetActionTexture(1)")
+            .unwrap()
+            .as_deref(),
+        Some("Interface\\Icons\\Ability_MeleeDamage")
+    );
+}
+
 /// The first resolve asks for the template and shows the placeholder; the answer re-resolves.
 #[test]
 fn a_landed_item_template_redisplays_the_action_slot() {
@@ -114,6 +145,35 @@ fn a_landed_item_template_redisplays_the_action_slot() {
         fed_texture(&mut app).as_deref(),
         Some(JERKY_ICON),
         "the landed template redisplays the slot — the fresh character's food loses its question mark"
+    );
+}
+
+#[test]
+fn offline_starter_attack_keeps_its_icon_without_a_spell_catalog() {
+    let (mut app, _rx) = app_with_food_on_the_bar();
+    {
+        let mut actions = app.world_mut().resource_mut::<PlayerActions>();
+        actions.buttons.clear();
+        actions.buttons.insert(
+            0,
+            ActionButton {
+                slot: 0,
+                action: super::SPELL_ATTACK,
+                kind: ACTION_KIND_SPELL,
+            },
+        );
+        actions.dirty = true;
+    }
+
+    app.update();
+
+    assert_eq!(
+        app.world_mut()
+            .non_send_resource::<UiScript>()
+            .eval::<Option<String>>("return GetActionTexture(1)")
+            .unwrap()
+            .as_deref(),
+        Some("Interface\\Icons\\Ability_MeleeDamage")
     );
 }
 

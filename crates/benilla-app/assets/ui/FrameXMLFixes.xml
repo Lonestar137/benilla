@@ -47,5 +47,55 @@
             end
         end
         RegisterForSave("FRIENDNAMEPLATES_ON")
+
+        -- The in-world micro buttons must still open their panels in the local session. Keep each
+        -- stock OnClick path, but supply its panel toggle when that handler returns without
+        -- changing visibility (some client handlers early-out on server login state).
+        local function HookMicroPanel(buttonName, panelName)
+            local button = getglobal(buttonName)
+            local panel = getglobal(panelName)
+            if not button or not panel then return end
+            local refOnClick = button:GetScript("OnClick")
+            button:SetScript("OnClick", function(self, clickButton)
+                local wasVisible = panel:IsVisible()
+                if refOnClick then
+                    local ok, err = pcall(refOnClick, self, clickButton)
+                    if not ok and geterrorhandler then geterrorhandler()(err) end
+                end
+                if panel:IsVisible() == wasVisible then
+                    if wasVisible then
+                        HideUIPanel(panel)
+                    else
+                        ShowUIPanel(panel)
+                    end
+                end
+            end)
+        end
+
+        HookMicroPanel("CharacterMicroButton", "CharacterFrame")
+        HookMicroPanel("SpellbookMicroButton", "SpellBookFrame")
+        HookMicroPanel("TalentMicroButton", "TalentFrame")
+        HookMicroPanel("QuestLogMicroButton", "QuestLogFrame")
+        HookMicroPanel("SocialsMicroButton", "FriendsFrame")
+        HookMicroPanel("WorldMapMicroButton", "WorldMapFrame")
+        HookMicroPanel("MainMenuMicroButton", "GameMenuFrame")
+        HookMicroPanel("HelpMicroButton", "HelpFrame")
+
+        -- `UpdateMicroButtons` uses the server's login state for button enablement. The local
+        -- session has no server login packet, so keep the in-world micro row interactive.
+        local microButtonNames = {
+            "CharacterMicroButton", "SpellbookMicroButton", "TalentMicroButton",
+            "QuestLogMicroButton", "SocialsMicroButton", "WorldMapMicroButton",
+            "MainMenuMicroButton", "HelpMicroButton",
+        }
+        local Ref_UpdateMicroButtons = UpdateMicroButtons
+        function UpdateMicroButtons()
+            if Ref_UpdateMicroButtons then Ref_UpdateMicroButtons() end
+            for _, name in ipairs(microButtonNames) do
+                local button = getglobal(name)
+                if button then button:Enable() end
+            end
+        end
+        UpdateMicroButtons()
     ]]></Script>
 </Ui>

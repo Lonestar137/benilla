@@ -365,7 +365,8 @@ pub(super) fn feed_actions(
                             icons.as_deref(),
                             &commands,
                         )
-                    });
+                    })
+                    .or_else(|| starter_action_icon(button.action));
                     (icon, 0, false)
                 }
                 ACTION_KIND_ITEM => {
@@ -516,4 +517,13 @@ fn spell_action_icon(
                 .and_then(|_| d.active_icon.clone())
         })
         .or_else(|| d.icon.clone())
+}
+
+/// Keep the offline starter abilities visible if an optional display row is absent.
+fn starter_action_icon(spell_id: u32) -> Option<String> {
+    match spell_id {
+        super::SPELL_ATTACK => Some("Interface\\Icons\\Ability_MeleeDamage".into()),
+        133 => Some("Interface\\Icons\\Spell_Fire_FlameBolt".into()),
+        _ => None,
+    }
 }

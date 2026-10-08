@@ -69,7 +69,7 @@ pub(crate) struct NetOffline;
 
 /// Local roster requests and synthetic session events, used only by the build without transport.
 #[cfg(feature = "offline")]
-#[derive(Resource)]
+#[derive(Resource, Clone)]
 pub(crate) struct OfflineChannels {
     pub(crate) picks: Receiver<CharRequest>,
     pub(crate) events: Sender<SessionEvent>,

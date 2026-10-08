@@ -454,19 +454,12 @@ fn emit_world_entry(
             fields,
         },
     ];
-    if appearance.class == 8 {
-        events.push(SessionEvent::SpellBook {
-            spell_ids: vec![benilla_game_core::FIREBALL_SPELL_ID],
-            cooldowns: Vec::new(),
-        });
-        events.push(SessionEvent::ActionButtons {
-            buttons: vec![benilla_protocol::messages::ActionButton {
-                slot: 0,
-                action: benilla_game_core::FIREBALL_SPELL_ID,
-                kind: benilla_protocol::messages::ACTION_KIND_SPELL,
-            }],
-        });
-    }
+    let (spell_ids, buttons) = starter_loadout(appearance.class);
+    events.push(SessionEvent::SpellBook {
+        spell_ids,
+        cooldowns: Vec::new(),
+    });
+    events.push(SessionEvent::ActionButtons { buttons });
     for hostile in hostiles {
         let race = snapshot.appearance.race;
         let entry = hostile_entry(race);
@@ -540,6 +533,24 @@ fn emit_world_entry(
     }
 }
 
+fn starter_loadout(class: u8) -> (Vec<u32>, Vec<benilla_protocol::messages::ActionButton>) {
+    let mut spell_ids = vec![benilla_game_core::ATTACK_SPELL_ID];
+    let mut buttons = vec![benilla_protocol::messages::ActionButton {
+        slot: 0,
+        action: benilla_game_core::ATTACK_SPELL_ID,
+        kind: benilla_protocol::messages::ACTION_KIND_SPELL,
+    }];
+    if class == 8 {
+        spell_ids.push(benilla_game_core::FIREBALL_SPELL_ID);
+        buttons.push(benilla_protocol::messages::ActionButton {
+            slot: 1,
+            action: benilla_game_core::FIREBALL_SPELL_ID,
+            kind: benilla_protocol::messages::ACTION_KIND_SPELL,
+        });
+    }
+    (spell_ids, buttons)
+}
+
 fn starting_position(race: u8) -> Option<WorldPosition> {
     // Project-authored build-8606 starting anchors; gameplay rules and provenance are recorded in
     // `crates/benilla-game-core/RULES.md`.
@@ -593,9 +604,20 @@ fn drive_offline_gameplay(
     spells: Option<Res<crate::ui_action::Spells>>,
 ) {
     while let Ok(command) = channels.commands.try_recv() {
-        if let crate::net::ClientCommand::CancelCast { spell_id } = &command {
-            core.0.cancel_fireball(*spell_id);
-            continue;
+        match &command {
+            crate::net::ClientCommand::CancelCast { spell_id } => {
+                core.0.cancel_fireball(*spell_id);
+                continue;
+            }
+            crate::net::ClientCommand::AttackSwing { guid } => {
+                start_offline_auto_attack(&mut core.0, &channels, *guid);
+                continue;
+            }
+            crate::net::ClientCommand::AttackStop => {
+                stop_offline_auto_attack(&mut core.0, &channels);
+                continue;
+            }
+            _ => {}
         }
         if matches!(
             &command,
@@ -614,12 +636,23 @@ fn drive_offline_gameplay(
         }
         let mana_cost = match &command {
             crate::net::ClientCommand::CastSpell { spell_id, .. } => {
-                spells.as_deref().and_then(|spells| {
-                    let spell = spells.catalog.get(*spell_id)?;
-                    let cast_time_ms =
-                        spells.cast_time_ms(spell, 1, &crate::spell::SpellModifiers::default());
-                    Some((spell.mana_cost, cast_time_ms))
-                })
+                spells
+                    .as_deref()
+                    .and_then(|spells| {
+                        let spell = spells.catalog.get(*spell_id)?;
+                        let cast_time_ms = spells.cast_time_ms(
+                            spell,
+                            1,
+                            &crate::spell::SpellModifiers::default(),
+                        );
+                        Some((spell.mana_cost, cast_time_ms))
+                    })
+                    .or_else(|| {
+                        (*spell_id == benilla_game_core::FIREBALL_SPELL_ID).then_some((
+                            benilla_game_core::FIREBALL_MANA_COST,
+                            benilla_game_core::FIREBALL_CAST_MS,
+                        ))
+                    })
             }
             _ => None,
         };
@@ -683,6 +716,50 @@ fn start_offline_cast(
     }
 }
 
+fn start_offline_auto_attack(core: &mut GameCore, channels: &OfflineChannels, target: u64) {
+    let Some(id) = core.active().cloned() else {
+        return;
+    };
+    let Some(snapshot) = core.snapshot(&id) else {
+        return;
+    };
+    let Some(spawn_id) = core
+        .hostiles()
+        .iter()
+        .find(|hostile| target == hostile_guid(snapshot.appearance.race, hostile.spawn_id))
+        .map(|hostile| hostile.spawn_id)
+    else {
+        return;
+    };
+    match core.start_auto_attack(spawn_id) {
+        Ok(()) => send_gameplay_events(
+            channels,
+            [SessionEvent::AttackStart {
+                attacker: id.presentation_guid(),
+                victim: target,
+            }],
+        ),
+        Err(error) => debug!("offline gameplay: rejected auto-attack at {target:#x}: {error}"),
+    }
+}
+
+fn stop_offline_auto_attack(core: &mut GameCore, channels: &OfflineChannels) {
+    let Some(spawn_id) = core.stop_auto_attack() else {
+        return;
+    };
+    let Some(id) = core.active() else { return };
+    let Some(snapshot) = core.snapshot(id) else {
+        return;
+    };
+    send_gameplay_events(
+        channels,
+        [SessionEvent::AttackStop {
+            attacker: id.presentation_guid(),
+            victim: hostile_guid(snapshot.appearance.race, spawn_id),
+        }],
+    );
+}
+
 fn advance_offline_combat(core: &mut GameCore, channels: &OfflineChannels, elapsed_ms: u32) {
     if core.active().is_none() {
         return;
@@ -732,6 +809,39 @@ fn advance_offline_combat(core: &mut GameCore, channels: &OfflineChannels, elaps
                     },
                 ];
                 send_gameplay_events(channels, events);
+            }
+            CombatUpdate::MeleeImpact(impact) => {
+                let Some(id) = core.active() else {
+                    continue;
+                };
+                let Some(snapshot) = core.snapshot(id) else {
+                    continue;
+                };
+                let victim = hostile_guid(snapshot.appearance.race, impact.spawn_id);
+                send_gameplay_events(
+                    channels,
+                    [
+                        SessionEvent::AttackerState(benilla_protocol::messages::AttackerState {
+                            attacker: id.presentation_guid(),
+                            victim,
+                            hit_info: 0,
+                            damage: impact.damage,
+                            victim_state: 1,
+                            absorb: 0,
+                            resist: 0,
+                            blocked: 0,
+                            melee_spell_id: 0,
+                            school: 0,
+                        }),
+                        SessionEvent::ObjectValues {
+                            guid: victim,
+                            fields: ObjectFields::from_pairs(&[
+                                (22, impact.remaining_health),
+                                (143, if impact.killed { 0x20 } else { 0 }),
+                            ]),
+                        },
+                    ],
+                );
             }
             CombatUpdate::Respawned { spawn_id } => {
                 let Some(id) = core.active() else {
@@ -1054,6 +1164,33 @@ mod tests {
     }
 
     #[test]
+    fn starter_loadouts_always_include_attack_and_only_mages_get_fireball() {
+        let (mage_spells, mage_buttons) = starter_loadout(8);
+        assert_eq!(
+            mage_spells,
+            [
+                benilla_game_core::ATTACK_SPELL_ID,
+                benilla_game_core::FIREBALL_SPELL_ID
+            ]
+        );
+        assert_eq!(
+            mage_buttons
+                .iter()
+                .map(|button| (button.slot, button.action))
+                .collect::<Vec<_>>(),
+            [
+                (0, benilla_game_core::ATTACK_SPELL_ID),
+                (1, benilla_game_core::FIREBALL_SPELL_ID)
+            ]
+        );
+
+        let (warrior_spells, warrior_buttons) = starter_loadout(1);
+        assert_eq!(warrior_spells, [benilla_game_core::ATTACK_SPELL_ID]);
+        assert_eq!(warrior_buttons.len(), 1);
+        assert_eq!(warrior_buttons[0].action, benilla_game_core::ATTACK_SPELL_ID);
+    }
+
+    #[test]
     fn offline_action_bar_cast_damages_and_respawns_a_spawned_hostile() {
         let appearance = Appearance {
             race: 1,
@@ -1098,13 +1235,18 @@ mod tests {
         assert!(entry_events.iter().any(|event| matches!(
             event,
             SessionEvent::SpellBook { spell_ids, .. }
-                if spell_ids == &[benilla_game_core::FIREBALL_SPELL_ID]
+                if spell_ids == &[
+                    benilla_game_core::ATTACK_SPELL_ID,
+                    benilla_game_core::FIREBALL_SPELL_ID
+                ]
         )));
         assert!(entry_events.iter().any(|event| matches!(
             event,
             SessionEvent::ActionButtons { buttons }
                 if buttons.iter().any(|button| button.slot == 0
-                    && button.action == benilla_game_core::FIREBALL_SPELL_ID)
+                    && button.action == benilla_game_core::ATTACK_SPELL_ID)
+                    && buttons.iter().any(|button| button.slot == 1
+                        && button.action == benilla_game_core::FIREBALL_SPELL_ID)
         )));
         let player_guid = id.presentation_guid();
         let player = entry_events.iter().find_map(|event| match event {
@@ -1211,6 +1353,176 @@ mod tests {
             received.try_recv().unwrap(),
             SessionEvent::ObjectValues { guid, ref fields }
                 if guid == hostile_guid && fields.unit_health() == Some(60)
+        ));
+    }
+
+    #[test]
+    fn offline_attack_action_starts_swings_stops_and_updates_hostile_health() {
+        let id = CharacterId::parse("00000000000000000000000000000001").unwrap();
+        let appearance = Appearance {
+            race: 1,
+            class: 8,
+            gender: 0,
+            skin: 0,
+            face: 0,
+            hair_style: 0,
+            hair_color: 0,
+            facial_hair: 0,
+        };
+        let mut core = GameCore::default();
+        core.create_character(id.clone(), "Alaera", appearance, starting_position(1).unwrap())
+            .unwrap();
+        core.enter_world().unwrap();
+        let start = core.snapshot(&id).unwrap().position;
+        core.update_active(
+            WorldPosition {
+                x: start.x + 8.0,
+                ..start
+            },
+            0,
+        )
+        .unwrap();
+
+        let (_pick_tx, picks) = crossbeam_channel::unbounded();
+        let (events, received) = crossbeam_channel::unbounded();
+        let (commands, command_receiver) = crossbeam_channel::unbounded();
+        let mut app = App::new();
+        app.insert_resource(OfflineChannels {
+            picks,
+            events,
+            commands: command_receiver,
+        })
+        .insert_resource(OfflineGameCore(core))
+        .insert_resource(OfflinePersistence { writable: false })
+        .insert_resource(Time::<()>::default());
+
+        let target = hostile_guid(appearance.race, benilla_game_core::HOSTILE_SPAWN_ID);
+        commands
+            .send(crate::net::ClientCommand::AttackSwing { guid: target })
+            .unwrap();
+        app.world_mut()
+            .run_system_once(drive_offline_gameplay)
+            .expect("offline attack command is handled");
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            SessionEvent::AttackStart { attacker, victim }
+                if attacker == id.presentation_guid() && victim == target
+        ));
+
+        let channels = app.world().resource::<OfflineChannels>().clone();
+        advance_offline_combat(
+            &mut app.world_mut().resource_mut::<OfflineGameCore>().0,
+            &channels,
+            benilla_game_core::MELEE_SWING_MS,
+        );
+        let swing: Vec<_> = received.try_iter().collect();
+        assert!(swing.iter().any(|event| matches!(
+            event,
+            SessionEvent::AttackerState(state)
+                if state.attacker == id.presentation_guid()
+                    && state.victim == target
+                    && state.damage == benilla_game_core::MELEE_DAMAGE
+        )));
+        assert!(swing.iter().any(|event| matches!(
+            event,
+            SessionEvent::ObjectValues { guid, fields }
+                if *guid == target
+                    && fields.unit_health()
+                        == Some(benilla_game_core::HOSTILE_MAX_HEALTH - benilla_game_core::MELEE_DAMAGE)
+        )));
+
+        commands.send(crate::net::ClientCommand::AttackStop).unwrap();
+        app.world_mut()
+            .run_system_once(drive_offline_gameplay)
+            .expect("offline stop command is handled");
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            SessionEvent::AttackStop { attacker, victim }
+                if attacker == id.presentation_guid() && victim == target
+        ));
+        let channels = app.world().resource::<OfflineChannels>().clone();
+        advance_offline_combat(
+            &mut app.world_mut().resource_mut::<OfflineGameCore>().0,
+            &channels,
+            benilla_game_core::MELEE_SWING_MS,
+        );
+        assert!(
+            received.try_iter().next().is_none(),
+            "stopped attacks do no more damage"
+        );
+    }
+
+    #[test]
+    fn offline_fireball_uses_project_rules_when_spell_catalog_is_unavailable() {
+        let id = CharacterId::parse("00000000000000000000000000000001").unwrap();
+        let appearance = Appearance {
+            race: 1,
+            class: 8,
+            gender: 0,
+            skin: 0,
+            face: 0,
+            hair_style: 0,
+            hair_color: 0,
+            facial_hair: 0,
+        };
+        let mut core = GameCore::default();
+        core.create_character(id.clone(), "Alaera", appearance, starting_position(1).unwrap())
+            .unwrap();
+        core.enter_world().unwrap();
+
+        let (_pick_tx, picks) = crossbeam_channel::unbounded();
+        let (events, received) = crossbeam_channel::unbounded();
+        let (commands, command_receiver) = crossbeam_channel::unbounded();
+        let mut app = App::new();
+        app.insert_resource(OfflineChannels {
+            picks,
+            events,
+            commands: command_receiver,
+        })
+        .insert_resource(OfflineGameCore(core))
+        .insert_resource(OfflinePersistence { writable: false })
+        .insert_resource(Time::<()>::default());
+
+        let target = hostile_guid(appearance.race, benilla_game_core::HOSTILE_SPAWN_ID);
+        commands
+            .send(crate::net::ClientCommand::CastSpell {
+                spell_id: benilla_game_core::FIREBALL_SPELL_ID,
+                target: Some(target),
+            })
+            .unwrap();
+        app.world_mut()
+            .run_system_once(drive_offline_gameplay)
+            .expect("offline Fireball cast is handled without a Spell.dbc resource");
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            SessionEvent::SpellStart {
+                spell_id: benilla_game_core::FIREBALL_SPELL_ID,
+                cast_time_ms: benilla_game_core::FIREBALL_CAST_MS,
+                ..
+            }
+        ));
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            SessionEvent::ObjectValues { fields, .. }
+                if fields.unit_power(0)
+                    == Some(benilla_game_core::STARTER_MANA - benilla_game_core::FIREBALL_MANA_COST)
+        ));
+
+        let channels = app.world().resource::<OfflineChannels>().clone();
+        advance_offline_combat(
+            &mut app.world_mut().resource_mut::<OfflineGameCore>().0,
+            &channels,
+            benilla_game_core::FIREBALL_CAST_MS,
+        );
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            SessionEvent::SpellGo { spell_id, .. }
+                if spell_id == benilla_game_core::FIREBALL_SPELL_ID
+        ));
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            SessionEvent::SpellDamageLog(log)
+                if log.spell_id == benilla_game_core::FIREBALL_SPELL_ID && log.damage == 30
         ));
     }
 
